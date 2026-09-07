@@ -30,7 +30,7 @@ cmake .. `
     -GNinja `
     -DCMAKE_MAKE_PROGRAM=ninja `
     -DCUDA_ENABLED="OFF" `
-    -DONNX_ENABLED="OFF" `
+    -DONNX_ENABLED="ON" `
     -DGUI_ENABLED="OFF" `
     -DCGAL_ENABLED="OFF" `
     -DLSD_ENABLED="OFF" `
