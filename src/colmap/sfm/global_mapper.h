@@ -31,7 +31,8 @@ struct GlobalMapperOptions {
   // Optional NeRF transforms.json with OpenGL camera-to-world poses. Paths in
   // the JSON are relative to its directory and must match images under
   // image_path. All reconstructed images need a prior. When set, skip rotation
-  // averaging and global positioning, triangulate tracks, then refine normally.
+  // averaging and try to skip global positioning by triangulating tracks from
+  // the priors. Falls back to global positioning when too many tracks fail.
   std::filesystem::path pose_prior_path;
 
   // When false, treat each non-ref sensor's cam_from_rig as a pre-calibrated.

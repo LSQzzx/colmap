@@ -83,11 +83,12 @@ void LoadPosePriors(const GlobalMapperOptions& options,
     reconstruction.RegisterFrame(frame_id);
   }
   LOG(INFO) << "Loaded pose priors for " << reconstruction.NumRegImages()
-            << " images; skipping rotation averaging and global positioning";
+            << " images";
 }
 
-void TriangulateTracks(const GlobalMapperOptions& options,
-                       Reconstruction& reconstruction) {
+std::pair<size_t, size_t> TriangulateTracks(const GlobalMapperOptions& options,
+                                            Reconstruction& reconstruction) {
+  const size_t num_tracks_before = reconstruction.NumPoints3D();
   EstimateTriangulationOptions tri_options;
   tri_options.min_tri_angle = DegToRad(options.min_tri_angle_deg);
   tri_options.ransac_options.max_error =
@@ -125,6 +126,8 @@ void TriangulateTracks(const GlobalMapperOptions& options,
   }
   LOG(INFO) << "Triangulated " << reconstruction.NumPoints3D()
             << " points from prior poses";
+  return {num_tracks_before - reconstruction.NumPoints3D(),
+          reconstruction.NumPoints3D()};
 }
 
 bool RunBundleAdjustment(const BundleAdjustmentOptions& options,
@@ -672,17 +675,36 @@ bool GlobalMapper::Solve(const GlobalMapperOptions& options,
   }
 
   // Global positioning
+  bool run_global_positioning =
+      !use_pose_priors && !options.skip_global_positioning;
   if (use_pose_priors) {
     LOG_HEADING1("Triangulating tracks from prior poses");
-    TriangulateTracks(options, *reconstruction_);
-    if (reconstruction_->NumPoints3D() == 0) {
+    NodeHashMap<point3D_t, Point3D> initial_tracks =
+        reconstruction_->Points3D();
+    const auto [num_deleted_tracks, num_remaining_tracks] =
+        TriangulateTracks(options, *reconstruction_);
+    LOG(INFO) << "Pose prior triangulation: deleted tracks = "
+              << num_deleted_tracks
+              << ", remaining tracks = " << num_remaining_tracks;
+    if (num_deleted_tracks > 0.3 * num_remaining_tracks) {
+      for (const point3D_t point3D_id : reconstruction_->Point3DIds()) {
+        reconstruction_->DeletePoint3D(point3D_id);
+      }
+      for (auto& [point3D_id, point3D] : initial_tracks) {
+        reconstruction_->AddPoint3D(point3D_id, std::move(point3D));
+      }
+      LOG(WARNING) << "Pose prior mismatch detected: deleted "
+                   << num_deleted_tracks << " tracks, remaining "
+                   << num_remaining_tracks
+                   << "; falling back to global positioning";
+      run_global_positioning = true;
+    } else if (num_remaining_tracks == 0) {
       LOG(ERROR) << "Could not triangulate any tracks from the pose priors";
       return false;
     }
-    if (report_and_check_stop()) {
-      return true;
-    }
-  } else if (!options.skip_global_positioning) {
+  }
+
+  if (run_global_positioning) {
     LOG_HEADING1("Running global positioning");
     Timer run_timer;
     run_timer.Start();
@@ -697,6 +719,10 @@ bool GlobalMapper::Solve(const GlobalMapperOptions& options,
 
     // Report the first 3D view after global positioning and stop early if
     // requested.
+    if (report_and_check_stop()) {
+      return true;
+    }
+  } else if (use_pose_priors) {
     if (report_and_check_stop()) {
       return true;
     }

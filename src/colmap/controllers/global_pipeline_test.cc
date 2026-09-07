@@ -38,11 +38,14 @@
 #include "colmap/util/testing.h"
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <iomanip>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -298,6 +301,86 @@ void DisconnectDatabaseComponents(
   }
 }
 
+void WritePosePriors(const Reconstruction& reconstruction,
+                     const std::filesystem::path& path,
+                     bool zero_translation = false) {
+  std::ofstream file(path);
+  file << std::setprecision(17) << "{\"frames\":[";
+  bool first = true;
+  for (const auto& [image_id, image] : reconstruction.Images()) {
+    file << (first ? "" : ",")
+         << "{\"file_path\":" << std::quoted("./image/" + image.Name())
+         << ",\"transform_matrix\":[";
+    first = false;
+    Eigen::Matrix3x4d matrix = Inverse(image.CamFromWorld()).ToMatrix();
+    matrix.col(1) *= -1;
+    matrix.col(2) *= -1;
+    if (zero_translation) {
+      matrix.col(3).setZero();
+    }
+    for (int row = 0; row < 3; ++row) {
+      file << '[' << matrix(row, 0) << ',' << matrix(row, 1) << ','
+           << matrix(row, 2) << ',' << matrix(row, 3) << "],";
+    }
+    file << "[0,0,0,1]]}";
+  }
+  file << "]}";
+}
+
+class FallbackLogSink : public google::LogSink {
+ public:
+  FallbackLogSink() { google::AddLogSink(this); }
+  ~FallbackLogSink() override { google::RemoveLogSink(this); }
+
+  void send(google::LogSeverity,
+            const char*,
+            const char*,
+            int,
+            const struct ::tm*,
+            const char* message,
+            size_t message_len) override {
+    if (std::string_view(message, message_len)
+            .find("falling back to global positioning") !=
+        std::string_view::npos) {
+      saw_fallback_ = true;
+    }
+  }
+
+  bool SawFallback() const { return saw_fallback_; }
+
+ private:
+  std::atomic<bool> saw_fallback_ = false;
+};
+
+TEST(GlobalPipeline, FallsBackFromMismatchedPosePriors) {
+  const auto test_dir = CreateTestDir();
+  auto database = Database::Open(test_dir / "database.db");
+  Reconstruction ground_truth;
+  SyntheticDatasetOptions dataset_options;
+  dataset_options.num_frames_per_rig = 7;
+  dataset_options.num_points3D = 50;
+  dataset_options.two_view_geometry_has_relative_pose = true;
+  SynthesizeDataset(dataset_options, &ground_truth, database.get());
+
+  const auto prior_path = test_dir / "transforms.json";
+  WritePosePriors(ground_truth, prior_path, /*zero_translation=*/true);
+  auto manager = std::make_shared<ReconstructionManager>();
+  GlobalPipelineOptions options;
+  options.num_threads = 1;
+  options.random_seed = 0;
+  options.decompose_relative_pose = false;
+  options.mapper.pose_prior_path = prior_path;
+  options.image_path = test_dir / "image";
+  FallbackLogSink log_sink;
+  GlobalPipeline pipeline(options, database, manager);
+  pipeline.Run();
+
+  EXPECT_TRUE(log_sink.SawFallback());
+  ASSERT_EQ(manager->Size(), 1);
+  EXPECT_GT(manager->Get(0)->NumPoints3D(), 0);
+  EXPECT_LT(manager->Get(0)->ComputeMeanReprojectionError(), 1e-4);
+}
+
 TEST(GlobalPipeline, WithPosePriors) {
   const auto test_dir = CreateTestDir();
   auto database = Database::Open(test_dir / "database.db");
@@ -310,6 +393,7 @@ TEST(GlobalPipeline, WithPosePriors) {
   dataset_options.two_view_geometry_has_relative_pose = true;
   SynthesizeDataset(dataset_options, &ground_truth, database.get());
   DisconnectDatabaseComponents(GroupImageIdsByRig(ground_truth), *database);
+
   // Wrong relative rotations must not override the absolute pose priors,
   // including in the pipeline's component decomposition pass.
   for (auto [pair_id, geometry] : database->ReadTwoViewGeometries()) {
@@ -319,26 +403,7 @@ TEST(GlobalPipeline, WithPosePriors) {
   }
 
   const auto prior_path = test_dir / "transforms.json";
-  {
-    std::ofstream file(prior_path);
-    file << std::setprecision(17) << "{\"frames\":[";
-    bool first = true;
-    for (const auto& [image_id, image] : ground_truth.Images()) {
-      file << (first ? "" : ",")
-           << "{\"file_path\":" << std::quoted("./image/" + image.Name())
-           << ",\"transform_matrix\":[";
-      first = false;
-      Eigen::Matrix3x4d matrix = Inverse(image.CamFromWorld()).ToMatrix();
-      matrix.col(1) *= -1;
-      matrix.col(2) *= -1;
-      for (int row = 0; row < 3; ++row) {
-        file << '[' << matrix(row, 0) << ',' << matrix(row, 1) << ','
-             << matrix(row, 2) << ',' << matrix(row, 3) << "],";
-      }
-      file << "[0,0,0,1]]}";
-    }
-    file << "]}";
-  }
+  WritePosePriors(ground_truth, prior_path);
 
   for (const bool multiple_models : {false, true}) {
     for (const bool refine : {false, true}) {

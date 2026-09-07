@@ -27,8 +27,8 @@ void BindGlobalMapper(py::module& m) {
         .def_readwrite(
             "pose_prior_path",
             &Opts::pose_prior_path,
-            "NeRF transforms.json with OpenGL camera-to-world poses. "
-            "Skips rotation averaging and global positioning.")
+            "NeRF transforms.json with OpenGL camera-to-world poses. Skips "
+            "rotation averaging and uses the poses to initialize tracks.")
         .def_readwrite(
             "image_path",
             &Opts::image_path,
