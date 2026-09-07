@@ -38,6 +38,8 @@
 #include "colmap/util/testing.h"
 
 #include <algorithm>
+#include <fstream>
+#include <iomanip>
 #include <utility>
 #include <vector>
 
@@ -294,6 +296,93 @@ void DisconnectDatabaseComponents(
       database.DeleteMatches(image_id1, image_id2);
     }
   }
+}
+
+TEST(GlobalPipeline, WithPosePriors) {
+  const auto test_dir = CreateTestDir();
+  auto database = Database::Open(test_dir / "database.db");
+  Reconstruction ground_truth;
+  SyntheticDatasetOptions dataset_options;
+  dataset_options.num_rigs = 2;
+  dataset_options.num_cameras_per_rig = 2;
+  dataset_options.num_frames_per_rig = 5;
+  dataset_options.num_points3D = 50;
+  dataset_options.two_view_geometry_has_relative_pose = true;
+  SynthesizeDataset(dataset_options, &ground_truth, database.get());
+  DisconnectDatabaseComponents(GroupImageIdsByRig(ground_truth), *database);
+  // Wrong relative rotations must not override the absolute pose priors,
+  // including in the pipeline's component decomposition pass.
+  for (auto [pair_id, geometry] : database->ReadTwoViewGeometries()) {
+    const auto [image_id1, image_id2] = PairIdToImagePair(pair_id);
+    geometry.cam2_from_cam1 = Rigid3d();
+    database->UpdateTwoViewGeometry(image_id1, image_id2, geometry);
+  }
+
+  const auto prior_path = test_dir / "transforms.json";
+  {
+    std::ofstream file(prior_path);
+    file << std::setprecision(17) << "{\"frames\":[";
+    bool first = true;
+    for (const auto& [image_id, image] : ground_truth.Images()) {
+      file << (first ? "" : ",")
+           << "{\"file_path\":" << std::quoted("./image/" + image.Name())
+           << ",\"transform_matrix\":[";
+      first = false;
+      Eigen::Matrix3x4d matrix = Inverse(image.CamFromWorld()).ToMatrix();
+      matrix.col(1) *= -1;
+      matrix.col(2) *= -1;
+      for (int row = 0; row < 3; ++row) {
+        file << '[' << matrix(row, 0) << ',' << matrix(row, 1) << ','
+             << matrix(row, 2) << ',' << matrix(row, 3) << "],";
+      }
+      file << "[0,0,0,1]]}";
+    }
+    file << "]}";
+  }
+
+  for (const bool multiple_models : {false, true}) {
+    for (const bool refine : {false, true}) {
+      auto manager = std::make_shared<ReconstructionManager>();
+      GlobalPipelineOptions options;
+      options.num_threads = 1;
+      options.random_seed = 0;
+      options.multiple_models = multiple_models;
+      options.decompose_relative_pose = false;
+      options.mapper.pose_prior_path = prior_path;
+      options.image_path = test_dir / "image";
+      options.mapper.skip_bundle_adjustment = !refine;
+      options.mapper.skip_retriangulation = !refine;
+      GlobalPipeline pipeline(options, database, manager);
+      pipeline.Run();
+      ASSERT_EQ(manager->Size(), multiple_models ? 2 : 1);
+      for (size_t i = 0; i < manager->Size(); ++i) {
+        const auto& reconstruction = *manager->Get(i);
+        EXPECT_EQ(reconstruction.NumRegImages(), 10);
+        EXPECT_GT(reconstruction.NumPoints3D(), 0);
+        EXPECT_LT(reconstruction.ComputeMeanReprojectionError(), 1e-4);
+        if (!refine) {
+          for (const image_t image_id : reconstruction.RegImageIds()) {
+            EXPECT_TRUE(
+                reconstruction.Image(image_id)
+                    .CamFromWorld()
+                    .ToMatrix()
+                    .isApprox(
+                        ground_truth.Image(image_id).CamFromWorld().ToMatrix(),
+                        1e-10));
+          }
+        }
+      }
+    }
+  }
+
+  // An explicitly supplied but incomplete prior file must fail, rather than
+  // silently initializing missing cameras or falling back to random poses.
+  std::ofstream(prior_path) << "{\"frames\":[]}";
+  GlobalPipelineOptions options;
+  options.mapper.pose_prior_path = prior_path;
+  auto manager = std::make_shared<ReconstructionManager>();
+  GlobalPipeline pipeline(options, database, manager);
+  EXPECT_ANY_THROW(pipeline.Run());
 }
 
 // Bridges the given image groups with `num_outlier_edges` cross-group two-view

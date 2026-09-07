@@ -2,6 +2,7 @@
 
 #include "colmap/estimators/bundle_adjustment_caspar.h"
 #include "colmap/estimators/rotation_averaging.h"
+#include "colmap/estimators/triangulation.h"
 #include "colmap/math/union_find.h"
 #include "colmap/scene/projection.h"
 #include "colmap/sfm/incremental_mapper.h"
@@ -13,8 +14,118 @@
 
 #include <algorithm>
 
+#include <boost/property_tree/json_parser.hpp>
+
 namespace colmap {
 namespace {
+
+void LoadPosePriors(const GlobalMapperOptions& options,
+                    Reconstruction& reconstruction) {
+  boost::property_tree::ptree root;
+  boost::property_tree::read_json(options.pose_prior_path.string(), root);
+  const auto prior_dir =
+      std::filesystem::absolute(options.pose_prior_path).parent_path();
+  const auto image_dir = options.image_path.empty()
+                             ? prior_dir
+                             : std::filesystem::absolute(options.image_path);
+  FlatHashMap<std::string, Rigid3d> cams_from_world;
+  for (const auto& [_, entry] : root.get_child("frames")) {
+    const auto path =
+        (prior_dir / entry.get<std::string>("file_path")).lexically_normal();
+    const auto& rows = entry.get_child("transform_matrix");
+    THROW_CHECK_EQ(rows.size(), 4) << "Invalid pose matrix for " << path;
+    Eigen::Matrix4d matrix;
+    int row = 0;
+    for (const auto& [_, values] : rows) {
+      THROW_CHECK_EQ(values.size(), 4) << "Invalid pose matrix for " << path;
+      int col = 0;
+      for (const auto& [_, value] : values) {
+        matrix(row, col++) = value.get_value<double>();
+      }
+      ++row;
+    }
+    THROW_CHECK(matrix.allFinite()) << "Non-finite pose for " << path;
+    THROW_CHECK(matrix.row(3).isApprox(Eigen::RowVector4d(0, 0, 0, 1), 1e-6))
+        << "Invalid homogeneous pose for " << path;
+    Eigen::Matrix3d rotation = matrix.topLeftCorner<3, 3>();
+    THROW_CHECK((rotation.transpose() * rotation)
+                    .isApprox(Eigen::Matrix3d::Identity(), 1e-4))
+        << "Invalid rotation for " << path;
+    THROW_CHECK_LT(std::abs(rotation.determinant() - 1), 1e-4)
+        << "Invalid rotation determinant for " << path;
+    // NeRF/OpenGL cameras look down -Z with +Y up; COLMAP uses +Z and -Y.
+    rotation.col(1) *= -1;
+    rotation.col(2) *= -1;
+    const Rigid3d world_from_cam(Eigen::Quaterniond(rotation).normalized(),
+                                 matrix.topRightCorner<3, 1>());
+    THROW_CHECK(
+        cams_from_world.emplace(path.generic_string(), Inverse(world_from_cam))
+            .second)
+        << "Duplicate pose prior for " << path;
+  }
+
+  FlatHashMap<frame_t, Rigid3d> rigs_from_world;
+  for (const auto& [image_id, image] : reconstruction.Images()) {
+    const auto path = (image_dir / image.Name()).lexically_normal();
+    const auto it = cams_from_world.find(path.generic_string());
+    THROW_CHECK(it != cams_from_world.end())
+        << "Missing pose prior for image " << image.Name();
+    Frame frame = reconstruction.Frame(image.FrameId());
+    frame.SetCamFromWorld(image.CameraId(), it->second);
+    const auto [rig_it, inserted] =
+        rigs_from_world.emplace(image.FrameId(), frame.RigFromWorld());
+    THROW_CHECK(inserted || rig_it->second.ToMatrix().isApprox(
+                                frame.RigFromWorld().ToMatrix(), 1e-4))
+        << "Inconsistent pose priors for rig frame " << image.FrameId();
+  }
+  for (const auto& [frame_id, rig_from_world] : rigs_from_world) {
+    reconstruction.Frame(frame_id).SetRigFromWorld(rig_from_world);
+    reconstruction.RegisterFrame(frame_id);
+  }
+  LOG(INFO) << "Loaded pose priors for " << reconstruction.NumRegImages()
+            << " images; skipping rotation averaging and global positioning";
+}
+
+void TriangulateTracks(const GlobalMapperOptions& options,
+                       Reconstruction& reconstruction) {
+  EstimateTriangulationOptions tri_options;
+  tri_options.min_tri_angle = DegToRad(options.min_tri_angle_deg);
+  tri_options.ransac_options.max_error =
+      DegToRad(options.max_angular_reproj_error_deg);
+  tri_options.ransac_options.random_seed = options.random_seed;
+  for (const point3D_t point3D_id : reconstruction.Point3DIds()) {
+    const Track track = reconstruction.Point3D(point3D_id).track;
+    std::vector<Eigen::Vector2d> points;
+    std::vector<Rigid3d> cams_from_world;
+    std::vector<const Camera*> cameras;
+    for (const auto& el : track.Elements()) {
+      const auto& image = reconstruction.Image(el.image_id);
+      points.push_back(image.Point2D(el.point2D_idx).xy);
+      cams_from_world.push_back(image.CamFromWorld());
+      cameras.push_back(image.CameraPtr());
+    }
+    std::vector<char> inlier_mask;
+    Eigen::Vector3d xyz;
+    const bool success = EstimateTriangulation(
+        tri_options, points, cams_from_world, cameras, &inlier_mask, &xyz);
+    reconstruction.DeletePoint3D(point3D_id);
+    if (!success) {
+      continue;
+    }
+    Track inlier_track;
+    for (size_t i = 0; i < inlier_mask.size(); ++i) {
+      if (inlier_mask[i]) {
+        inlier_track.AddElement(track.Element(i));
+      }
+    }
+    if (inlier_track.Length() >=
+        static_cast<size_t>(options.track_min_num_views_per_track)) {
+      reconstruction.AddPoint3D(xyz, std::move(inlier_track));
+    }
+  }
+  LOG(INFO) << "Triangulated " << reconstruction.NumPoints3D()
+            << " points from prior poses";
+}
 
 bool RunBundleAdjustment(const BundleAdjustmentOptions& options,
                          Reconstruction& reconstruction) {
@@ -522,8 +633,24 @@ bool GlobalMapper::Solve(const GlobalMapperOptions& options,
     return on_progress();
   };
 
+  const bool use_pose_priors = !options.pose_prior_path.empty();
+  if (use_pose_priors) {
+    LoadPosePriors(options, *reconstruction_);
+    const auto active_frames = pose_graph_->LargestConnectedFrameComponent(
+        *reconstruction_, /*filter_unregistered=*/true);
+    const auto reg_frame_ids = reconstruction_->RegFrameIds();
+    for (const frame_t frame_id : reg_frame_ids) {
+      if (!active_frames.count(frame_id)) {
+        reconstruction_->DeRegisterFrame(frame_id);
+      }
+    }
+    const auto image_ids = reconstruction_->RegImageIds();
+    pose_graph_->InvalidatePairsOutsideActiveImageIds(
+        {image_ids.begin(), image_ids.end()});
+  }
+
   // Run rotation averaging
-  if (!options.skip_rotation_averaging) {
+  if (!use_pose_priors && !options.skip_rotation_averaging) {
     LOG_HEADING1("Running rotation averaging");
     Timer run_timer;
     run_timer.Start();
@@ -545,7 +672,17 @@ bool GlobalMapper::Solve(const GlobalMapperOptions& options,
   }
 
   // Global positioning
-  if (!options.skip_global_positioning) {
+  if (use_pose_priors) {
+    LOG_HEADING1("Triangulating tracks from prior poses");
+    TriangulateTracks(options, *reconstruction_);
+    if (reconstruction_->NumPoints3D() == 0) {
+      LOG(ERROR) << "Could not triangulate any tracks from the pose priors";
+      return false;
+    }
+    if (report_and_check_stop()) {
+      return true;
+    }
+  } else if (!options.skip_global_positioning) {
     LOG_HEADING1("Running global positioning");
     Timer run_timer;
     run_timer.Start();

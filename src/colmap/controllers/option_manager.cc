@@ -796,6 +796,8 @@ void OptionManager::AddGlobalMapperOptions() {
   added_global_mapper_options_ = true;
 
   // Global mapper options.
+  AddDefaultOption("GlobalMapper.pose_prior_path",
+                   &global_mapper->mapper.pose_prior_path);
   AddDefaultOption("GlobalMapper.image_list_path",
                    &global_mapper_image_list_path_);
   AddDefaultOption("GlobalMapper.min_num_matches",

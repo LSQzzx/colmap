@@ -182,6 +182,21 @@ database::
         --image_path $DATASET_PATH/images \
         --output_path $DATASET_PATH/sparse
 
+To initialize the global mapper from known camera poses, add
+``--GlobalMapper.pose_prior_path /path/to/transforms.json``. The file uses the
+NeRF format: each entry in ``frames`` contains ``file_path`` and a 4x4
+``transform_matrix`` in OpenGL camera-to-world convention (+X right, +Y up,
+-Z forward). Image paths are resolved relative to the JSON file and matched
+against images under ``--image_path``; every reconstructed image must have a
+valid prior. Camera intrinsics still come from the database; multi-camera rigs
+must have calibrated sensor extrinsics.
+
+With pose priors, rotation averaging (including component decomposition) and
+global positioning are skipped automatically. Tracks are triangulated from the
+loaded poses before the usual bundle adjustment and retriangulation. The priors
+are initial estimates, not fixed constraints: refinement can change the poses
+and normalize the reconstruction's coordinate system.
+
 If you want to run COLMAP on a computer without an attached display (e.g.,
 cluster or cloud service), COLMAP automatically switches to use CUDA if
 supported by your system. If no CUDA enabled device is available, you can

@@ -25,6 +25,11 @@ void BindGlobalMapper(py::module& m) {
         .def_readwrite("num_threads", &Opts::num_threads)
         .def_readwrite("random_seed", &Opts::random_seed)
         .def_readwrite(
+            "pose_prior_path",
+            &Opts::pose_prior_path,
+            "NeRF transforms.json with OpenGL camera-to-world poses. "
+            "Skips rotation averaging and global positioning.")
+        .def_readwrite(
             "image_path",
             &Opts::image_path,
             "The image path at which to find the images to extract point "

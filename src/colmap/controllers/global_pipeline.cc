@@ -213,7 +213,7 @@ void GlobalPipeline::Run() {
 
   const size_t first_reconstruction_idx = reconstruction_manager_->Size();
   ReconstructionStats stats;
-  if (options_.multiple_models) {
+  if (options_.multiple_models || !mapper_options.pose_prior_path.empty()) {
     stats = ReconstructMultiComponents(mapper_options);
   } else {
     const std::optional<std::shared_ptr<Reconstruction>> reconstruction =
@@ -289,18 +289,29 @@ GlobalPipeline::ReconstructionStats GlobalPipeline::ReconstructMultiComponents(
   // Decompose the view graph once after rotation filtering. The full mapper is
   // then run at most once per resulting component; any additional fragments
   // rejected by its refinement pass are not recursively retried.
-  ComponentDecomposition decomposition =
-      ComputeComponentsByRotationAveraging(mapper_options.RotationAveraging(),
-                                           pose_graph,
-                                           base,
-                                           pose_priors,
-                                           options_.min_model_size);
+  ComponentDecomposition decomposition;
+  if (!mapper_options.pose_prior_path.empty()) {
+    decomposition.components = pose_graph.ConnectedImageIdsForFrameComponents(
+        base, /*filter_unregistered=*/false);
+    if (!options_.multiple_models && decomposition.components.size() > 1) {
+      decomposition.components.resize(1);
+    }
+  } else {
+    decomposition =
+        ComputeComponentsByRotationAveraging(mapper_options.RotationAveraging(),
+                                             pose_graph,
+                                             base,
+                                             pose_priors,
+                                             options_.min_model_size);
+  }
   stats.num_failed += decomposition.num_failed;
   stats.num_too_small += decomposition.num_too_small;
   std::vector<FlatHashSet<image_t>>& components = decomposition.components;
 
-  LOG(INFO) << "Found " << components.size()
-            << " connected component(s) after rotation filtering";
+  LOG(INFO) << "Found " << components.size() << " connected component(s)"
+            << (mapper_options.pose_prior_path.empty()
+                    ? " after rotation filtering"
+                    : " using prior poses");
 
   for (size_t component_idx = 0; component_idx < components.size();
        ++component_idx) {
