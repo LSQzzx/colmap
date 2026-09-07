@@ -212,7 +212,7 @@ jobs:
 
           if [ "${{ matrix.config.cudaEnabled }}" = "true" ]; then
             CIBW_MANYLINUX_X86_64_IMAGE="pytorch/manylinux2_28-builder:cuda12.9"
-            CIBW_REPAIR_WHEEL_COMMAND="auditwheel repair --exclude libcudart* --exclude libcurand* -w {dest_dir} {wheel}"
+            CIBW_REPAIR_WHEEL_COMMAND="auditwheel repair --exclude libcudart* --exclude libcurand* -w {dest_dir} {wheel} && python {project}/python/ci/bundle_onnxruntime_providers.py {wheel} {dest_dir} /usr/local"
             echo "CIBW_REPAIR_WHEEL_COMMAND=${CIBW_REPAIR_WHEEL_COMMAND}" >> "$GITHUB_ENV"
             # Edit pyproject.toml to change package name to pycolmap-cuda12 and add CUDA Runtime native Libraries and CURAND native runtime libraries to dependencies
             pip install tomlkit
@@ -248,6 +248,29 @@ jobs:
           fi
           "${CCACHE}" --cleanup
           "${CCACHE}" --show-stats --verbose
+
+      - name: Verify ONNX Runtime providers in CUDA wheels
+        if: runner.os == 'Linux' && matrix.config.cudaEnabled
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          required = {
+              "libonnxruntime_providers_shared.so",
+              "libonnxruntime_providers_cuda.so",
+          }
+          wheels = tuple(Path("wheelhouse").glob("pycolmap_cuda12-*.whl"))
+          if not wheels:
+              raise RuntimeError("No pycolmap_cuda12 wheel was built")
+          for wheel in wheels:
+              with zipfile.ZipFile(wheel) as archive:
+                  names = {Path(name).name for name in archive.namelist()}
+              missing = required - names
+              if missing:
+                  raise RuntimeError(f"{wheel} is missing ONNX Runtime providers: {sorted(missing)}")
+              print(f"Verified ONNX Runtime providers in {wheel}")
+          PY
 
       - name: Show compiler cache stats (Windows)
         if: always() && runner.os == 'Windows'
