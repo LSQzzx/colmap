@@ -106,6 +106,7 @@ struct GlobalMapperOptions {
   // Control the flow of the global sfm
   bool skip_rotation_averaging = false;
   bool skip_track_establishment = false;
+  // Also disables fallback after a pose-prior mismatch.
   bool skip_global_positioning = false;
   bool skip_bundle_adjustment = false;
   bool skip_retriangulation = false;

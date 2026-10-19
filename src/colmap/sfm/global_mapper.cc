@@ -686,7 +686,9 @@ bool GlobalMapper::Solve(const GlobalMapperOptions& options,
     LOG(INFO) << "Pose prior triangulation: deleted tracks = "
               << num_deleted_tracks
               << ", remaining tracks = " << num_remaining_tracks;
-    if (num_deleted_tracks > 0.3 * num_remaining_tracks) {
+    const bool pose_prior_mismatch =
+        num_deleted_tracks > 0.3 * num_remaining_tracks;
+    if (pose_prior_mismatch && !options.skip_global_positioning) {
       for (const point3D_t point3D_id : reconstruction_->Point3DIds()) {
         reconstruction_->DeletePoint3D(point3D_id);
       }
@@ -701,6 +703,10 @@ bool GlobalMapper::Solve(const GlobalMapperOptions& options,
     } else if (num_remaining_tracks == 0) {
       LOG(ERROR) << "Could not triangulate any tracks from the pose priors";
       return false;
+    } else if (pose_prior_mismatch) {
+      LOG(WARNING) << "Pose prior mismatch detected, but global positioning "
+                      "is disabled; continuing with "
+                   << num_remaining_tracks << " tracks";
     }
   }
 
